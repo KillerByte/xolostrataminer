@@ -4,13 +4,20 @@
 //===
 
 #include <iostream>
+#include <sstream>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
 #include <map>
 #include <boost/uuid/sha1.hpp>
 
+#include "json/json_spirit.h"
+
+using namespace json_spirit;
+
 #include "main_poolminer.h"
+
+#include "hex.h"
 
 #if defined(__GNUG__) && !defined(__MINGW32__) && !defined(__MINGW64__)
 #include <sys/syscall.h>
@@ -19,6 +26,9 @@
 #elif defined(__MINGW32__) || defined(__MINGW64__)
 #include <windows.h>
 #endif
+
+#define BEGIN(a)            ((char*)&(a))
+#define END(a)              ((char*)&((&(a))[1]))
 
 #define VERSION_MAJOR 1
 #define VERSION_MINOR 0
@@ -67,6 +77,12 @@ void convertDataToBlock(unsigned char* blockData, CBlock& block) {
 	block.bnPrimeChainMultiplier = 0;
 }
 
+uint256 hexToHash(std::string hex) {
+	CBigNum n;
+	n.setvch(ParseHex(hex));
+	return n.getuint256();
+}
+
 /*********************************
 * class CBlockProviderGW to (incl. SUBMIT_BLOCK)
 *********************************/
@@ -90,9 +106,45 @@ public:
 			block = new CBlock(*_block);
 			//memcpy(block, _block, 80+32+8);
 		}
-		block->nTime = GetAdjustedTimeWithOffset(thread_id, counter);
-		//std::cout << "[WORKER" << thread_id << "] block created @ " << new_time << std::endl;
+		
+		// Create merkle root
+		int en2 = rand(); // TODO: Save en2 somewhere
+		std::string extranonce2 = HexStr(BEGIN(en2), END(en2));
+		std::string cbtxn = coinb1 + extranonce1 + extranonce2 + coinb2;
+		//std::cout << "CBTXN: " << cbtxn << std::endl;
+		std::vector<unsigned char> coinbase = ParseHex(cbtxn);
+		uint256 cbHash = Hash(BEGIN(coinbase[0]), END(coinbase[coinbase.size() - 1]));
+		//std::cout << "CBHASH: " << cbHash.GetHex() << std::endl;
+		
+		unsigned char mr[32];
+		
+		// Time for some fun memory operations
+		unsigned char t[64];
+		memcpy(&t[0], cbHash.begin(), 32);
+		for(unsigned int i = 0;i < merkle_branch.size();i++) {
+			memcpy(&t[32], &ParseHex(merkle_branch[i])[0], 32);
+			memcpy(&t[0], Hash(BEGIN(t[0]), END(t[63])).begin(), 32);
+		}
+		
+		// We should now have our merkle root hash in t[0] - t[31]
+		memcpy(block->hashMerkleRoot.begin(), &t[0], 32);
+		
+		//std::cout << "MERKLE ROOT: " << block->hashMerkleRoot.GetHex() << std::endl;
+		//std::cout << "EN2: " << extranonce2 << std::endl;
+		
+		merkles[block->hashMerkleRoot] = extranonce2;
+		
+		block->nTime = GetAdjustedTimeWithOffset(0, 0); // No need to mess with times
+		std::cout << "[WORKER" << thread_id << "] block created @ " << block->nTime << std::endl;
 		return block;
+	}
+	
+	void setExtraNonce2Len(int len) {
+		extranonce2_size = len;
+	}
+	
+	void setExtraNonce1(std::string len) {
+		extranonce1 = len;
 	}
 	
 	virtual CBlock* getOriginalBlock() {
@@ -110,54 +162,86 @@ public:
 		if (old_block != NULL) delete old_block;
 	}
 
-	void setBlocksFromData(unsigned char* data) {
+	void setBlocksFromData(mArray params) {
+		job_id = params[0].get_str();
 		CBlock* block = new CBlock();
-		//
-		convertDataToBlock(data,*block);
-		//
+		block->hashPrevBlock = hexToHash(params[1].get_str());
+		std::cout << "PREVHASH: " << block->hashPrevBlock.GetHex() << std::endl;
+		coinb1 = params[2].get_str();
+		coinb2 = params[3].get_str();
+		
+		std::cout << "COINB1: " << coinb1 << std::endl;
+		std::cout << "COINB2: " << coinb2 << std::endl;
+		
+		mArray mb = params[4].get_array();
+		merkle_branch.clear();
+		for(unsigned int i = 0;i < mb.size();i++) merkle_branch.push_back(mb[i].get_str());
+		// Cheat way to turn hex to normal int
+		CBigNum c;
+		c.setvch(ParseHex(params[5].get_str()));
+		block->nVersion = c.getint();
+		std::cout << "VERSION: " << block->nVersion << std::endl;
+		c.setvch(ParseHex(params[6].get_str()));
+		block->nBits = c.getint();
+		std::cout << "BITS: " << block->nBits << std::endl;
+		c.setvch(ParseHex(params[7].get_str()));
+		block->nTime = c.getint();
+		std::cout << "TIME: " << block->nTime << std::endl;
+		block->nNonce = 0;
+		block->bnPrimeChainMultiplier = 0;
+		
 		unsigned int nTime_local = time(NULL);
 		unsigned int nTime_server = block->nTime;
 		nTime_offset = nTime_local > nTime_server ? 0 : (nTime_server-nTime_local);
-		//
+		
 		setBlockTo(block);
+		
+		merkles.clear();
 	}
 
 	void submitBlock(CBlock *block, unsigned int thread_id) {
 		if (socket_to_server != NULL) {
-			blockHeader_t blockraw;
-			blockraw.nVersion       = block->nVersion;
-			blockraw.hashPrevBlock  = block->hashPrevBlock;
-			blockraw.hashMerkleRoot = block->hashMerkleRoot;
-			blockraw.nTime          = block->nTime;
-			blockraw.nBits          = block->nBits;
-			blockraw.nNonce         = block->nNonce;
-
-			//std::cout << "submitting: " << block->hashMerkleRoot.ToString().c_str() << " from " << thread_id << std::endl;
-
-			std::vector<unsigned char> primemultiplier = block->bnPrimeChainMultiplier.getvch();
-			if (primemultiplier.size() > 47) {
-				std::cerr << "[WORKER] share submission warning: not enough space for primemultiplier" << std::endl;
-				return;
-			}
-
-			blockraw.primemultiplier[0] = primemultiplier.size();
-			for (size_t i = 0; i < primemultiplier.size(); ++i)
-				blockraw.primemultiplier[1 + i] = primemultiplier[i];		
-
-			if (socket_to_server == NULL)
-				return;
-
-			std::cout << "[WORKER] share found @ " << blockraw.nTime << " by thr" << thread_id << std::endl;
-			boost::system::error_code submit_error = boost::asio::error::host_not_found;
-			if (socket_to_server != NULL) boost::asio::write(*socket_to_server, boost::asio::buffer((unsigned char*)&blockraw, 128), boost::asio::transfer_all(), submit_error); //FaF
-			//if (submit_error)
-			//	std::cout << submit_error << " @ submit" << std::endl;
-			if (!submit_error)
-				++totalShareCount;
+			
+			// Get mapped extranonce
+			std::string extranonce2 = merkles[block->hashMerkleRoot]; // Should always work if worker threads are updating
+			if(extranonce2 == "") extranonce2 = "ffffffff"; // So that we dont crash in case of a problem, but the share will be invalid
+			// Encode time, nonce, and primemultiplier
+			std::string time = HexStr(BEGIN(block->nTime), END(block->nTime));
+			std::string nonce = HexStr(BEGIN(block->nNonce), END(block->nNonce));
+			std::string pm = block->bnPrimeChainMultiplier.GetHex();
+			
+			// Prepare the JSON packet
+			Object submit_msg;
+			Array params;
+			
+			params.push_back(pool_username);
+			params.push_back(job_id);
+			params.push_back(extranonce2);
+			params.push_back(time);
+			params.push_back(nonce);
+			params.push_back(pm);
+			
+			submit_msg.push_back(Pair("params", params));
+			submit_msg.push_back(Pair("id", rand() % 999000 + 1000));
+			submit_msg.push_back(Pair("method", "mining.submit"));
+			
+			// Send the line
+			
+			if(socket_to_server != NULL) boost::asio::write(*socket_to_server, boost::asio::buffer(write(submit_msg) + "\n"));
 		}
 	}
 
 protected:
+	std::string job_id;
+	std::string coinb1;
+	std::string extranonce1;
+	std::string coinb2;
+	int extranonce2_size;
+	
+	std::map<uint256, std::string> merkles;
+	
+	std::vector<std::string> merkle_branch;
+
 	unsigned int nTime_offset;
 	boost::shared_mutex _mutex_getwork;
 	CBlock* _block;
@@ -256,7 +340,7 @@ public:
 				(poolnum == 2 && GetArg("-poolip3", "").length() > 0) ? GetArg("-poolip3", "") :
 				GetArg("-poolip", "127.0.0.1")
 				,
-				(poolnum == 0) ? GetArg("-poolport", "1337") :
+				(poolnum == 0) ? GetArg("-poolport", "3333") :
 				(poolnum == 1 && GetArg("-poolport2", "").length() > 0) ? GetArg("-poolport2", "") :
 				(poolnum == 2 && GetArg("-poolport3", "").length() > 0) ? GetArg("-poolport3", "") :
 				GetArg("-poolport", "1337")
@@ -287,119 +371,97 @@ public:
 				totalShareCount = 0;
 			}
 
-			{ //send hello message
-				char* hello = new char[pool_username.length()+/*v0.2/0.3=*/2+/*v0.4=*/20+/*v0.7=*/1+pool_password.length()];
-				memcpy(hello+1, pool_username.c_str(), pool_username.length());
-				*((unsigned char*)hello) = pool_username.length();
-				*((unsigned char*)(hello+pool_username.length()+1)) = 0; //hi, i'm v0.4+
-				*((unsigned char*)(hello+pool_username.length()+2)) = VERSION_MAJOR;
-				*((unsigned char*)(hello+pool_username.length()+3)) = VERSION_MINOR;
-				*((unsigned char*)(hello+pool_username.length()+4)) = thread_num_max;
-				*((unsigned char*)(hello+pool_username.length()+5)) = pool_fee_percent;
-				*((unsigned short*)(hello+pool_username.length()+6)) = miner_id;
-				*((unsigned int*)(hello+pool_username.length()+8)) = 0; //TODO: nSieveExtensions;
-				*((unsigned int*)(hello+pool_username.length()+12)) = 0; //TODO: nSievePercentage;
-				*((unsigned int*)(hello+pool_username.length()+16)) = 0; //TODO: nSieveSize;
-				*((unsigned char*)(hello+pool_username.length()+20)) = pool_password.length();
-				memcpy(hello+pool_username.length()+21, pool_password.c_str(), pool_password.length());
-				*((unsigned short*)(hello+pool_username.length()+21+pool_password.length())) = developer_fee_id; //EXTENSIONS
-				boost::system::error_code error;
-				socket->write_some(boost::asio::buffer(hello, pool_username.length()+2+20+1+pool_password.length()), error);
-				//if (error)
-				//	std::cout << error << " @ write_some_hello" << std::endl;
-				delete[] hello;
-			}
+			// Subscribe
+			std::string buf = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
+			socket->write_some(boost::asio::buffer(buf));
 
 			socket_to_server = socket.get(); //TODO: lock/mutex
 
 			int reject_counter = 0;
 			bool done = false;
+			boost::asio::streambuf b;
 			while (!done) {
-				int type = -1;
-				{ //get the data header
-					unsigned char buf = 0; //get header
+				{
 					boost::system::error_code error;
-					size_t len = boost::asio::read(*socket_to_server, boost::asio::buffer(&buf, 1), boost::asio::transfer_all(), error);
+					boost::asio::read_until(*socket_to_server, b, "\n", error);
 					if (error == boost::asio::error::eof)
 						break; // Connection closed cleanly by peer.
 					else if (error) {
-						//std::cout << error << " @ read_some1" << std::endl;
+						std::cout << error << " @ read_some1" << std::endl;
 						break;
 					}
-					type = buf;
-					if (len != 1)
-						std::cout << "error on read1: " << len << " should be " << 1 << std::endl;
+					
 				}
-				switch (type) {
-					case 0: {
-						size_t buf_size = 128;
-						unsigned char* buf = new unsigned char[buf_size]; //get header
-						boost::system::error_code error;
-						size_t len = boost::asio::read(*socket_to_server, boost::asio::buffer(buf, buf_size), boost::asio::transfer_all(), error);
-						if (error == boost::asio::error::eof) {
-							done = true;
-							break; // Connection closed cleanly by peer.
-						} else if (error) {
-							//std::cout << error << " @ read2a" << std::endl;
-							done = true;
-							break;
-						}
-						if (len == buf_size) {
-							_bprovider->setBlocksFromData(buf);
-							std::cout << "[MASTER] work received" << std::endl;
-							//TODO:
-							//if (_bprovider->getOriginalBlock() != NULL) print256("sharetarget", (uint32_t*)(_bprovider->getOriginalBlock()->targetShare));
-							//else std::cout << "<NULL>" << std::endl;
-						} else
-							std::cout << "error on read2a: " << len << " should be " << buf_size << std::endl;
-						delete[] buf;
-						//TODO: check prime.cpp
-						CBlockIndex *pindexOld = pindexBest;
-						pindexBest = new CBlockIndex(); //=notify worker (this could need a efficient alternative)
-						delete pindexOld;
-					} break;
-					case 1: {
-						size_t buf_size = 4;
-						int buf; //get header
-						boost::system::error_code error;
-						size_t len = boost::asio::read(*socket_to_server, boost::asio::buffer(&buf, buf_size), boost::asio::transfer_all(), error);
-						if (error == boost::asio::error::eof) {
-							done = true;
-							break; // Connection closed cleanly by peer.
-						} else if (error) {
-							//std::cout << error << " @ read2b" << std::endl;
-							done = true;
-							break;
-						}
-						if (len == buf_size) {
-							int retval = buf > 100000 ? 1 : buf;
-							std::cout << "[MASTER] submitted share -> " << (retval == 0 ? "REJECTED" : retval < 0 ? "STALE" : retval == 1 ? "BLOCK" : "SHARE") << std::endl;
-							if (retval > 0)
-								reject_counter = 0;
-							else
-								reject_counter++;
-							if (reject_counter >= 3) {
-								std::cout << "too many rejects (3) in a row, forcing reconnect." << std::endl;
-								socket->close();
-								done = true;
+				
+				std::istream is(&b);
+				std::string req;
+				getline(is, req);
+				
+				try {
+					// Parse with JSON
+					mValue v;
+					if(read(req, v)) {
+						mObject obj = v.get_obj();
+						if(obj.count("method") > 0) {
+							std::string method = obj["method"].get_str();
+							mArray params = obj["params"].get_array();
+							
+							if(method == "mining.set_difficulty") {
+								pool_share_minimum = /*(int)ParseHex(params[0].get_str().substr(0,2))[0];*/6;
+								
+								std::cout << "Set difficulty to " << pool_share_minimum << std::endl;
 							}
-							{
-								std::map<int,unsigned long>::iterator it = statistics.find(retval);
-								if (it == statistics.end())
-									statistics.insert(std::pair<int,unsigned long>(retval,1));
-								else
-									statistics[retval]++;
+							else if(method == "mining.notify") {
+								_bprovider->setBlocksFromData(params);
+								CBlockIndex *pindexOld = pindexBest;
+								pindexBest = new CBlockIndex(); //=notify worker (this could need a efficient alternative)
+								delete pindexOld;
+								std::cout << "Work recieved!" << std::endl;
+							}
+								
+							std::stringstream ss;
+							ss << "{\"error\": null, \"id\": " << obj["id"].get_int() << ", \"result\": null}\n";
+							std::string res = ss.str();
+							boost::asio::write(*socket_to_server, boost::asio::buffer(res.c_str(), strlen(res.c_str())));
+							
+						}
+						else {
+							// Result of an operation
+							
+							// Subscribe result
+							int id = obj["id"].get_int();
+							mValue res = obj["result"];
+							if(id == 1) {
+								mArray arr = res.get_array();
+								_bprovider->setExtraNonce1(arr[1].get_str());
+								_bprovider->setExtraNonce2Len(arr[2].get_int());
+								std::cout << "Subscribed for work" << std::endl;
+							}
+							
+							// Authentication result
+							else if(id == 2) {
+								bool worked = res.get_bool();
+								if(worked) std::cout << "Successfully logged in!" << std::endl;
+								else std::cout << "Error logging in! Check details and try again!";
+							}
+							
+							// Share submit result
+							else if(id >= 1000 && id < 1000000) {
+								bool worked  = res.get_bool();
+								if(worked) {
+									
+								}
+								else {
+									std::cout << "Share submission failed!" << std::endl;
+									reject_counter++;
+								}
 								stats_running();
 							}
-						} else
-							std::cout << "error on read2b: " << len << " should be " << buf_size << std::endl;
-					} break;
-					case 2: {
-						//PING-PONG EVENT, nothing to do
-					} break;
-					default: {
-						//std::cout << "unknown header type = " << type << std::endl;
+						}
 					}
+					else std::cout << "JSON Parse Error from Server: " << req << std::endl;
+				} catch(std::exception e) {
+					std::cout << "Exception while processing JSON from pool: " << e.what() << std::endl;
 				}
 			}
 
