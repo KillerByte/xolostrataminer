@@ -1092,7 +1092,7 @@ bool MineProbablePrimeChain(CBlock& block, mpz_class& mpzFixedMultiplier, bool& 
         {
             // power tests completed for the sieve
             if (fDebug && GetBoolArg("-printmining2"))
-                printf("MineProbablePrimeChain() : %u tests (%u primes) in %uus\n", nTests, nPrimesHit, (unsigned int) (GetTimeMicros() - nStart));
+                printf("MineProbablePrimeChain() : %u tests (%u primes) in %uus\n - need new block", nTests, nPrimesHit, (unsigned int) (GetTimeMicros() - nStart));
             fNewBlock = true; // notify caller to change nonce
             return false;
         }

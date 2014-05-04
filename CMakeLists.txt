@@ -76,7 +76,10 @@ INCLUDE_DIRECTORIES("src")
 SET(SRC_FILES
 	src/prime.cpp
 	src/main_mining.cpp
-	src/main_poolminer.cpp		
+	src/main_poolminer.cpp
+	src/json/json_spirit_reader.cpp
+	src/json/json_spirit_value.cpp
+	src/json/json_spirit_writer.cpp
 )
 
 ###

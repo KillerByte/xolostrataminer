@@ -364,7 +364,7 @@ void primecoin_mine(CBlockProvider* bp, unsigned int thread_id)
                 nRoundPrimesHit = 0;
 
                 // Primecoin: update time and nonce
-                pblock->nTime = std::max(pblock->nTime, bp->GetAdjustedTimeWithOffset(thread_id, blockcnt));
+                pblock->nTime = std::max(pblock->nTime, bp->GetAdjustedTimeWithOffset(0,0));
                 for(;;)
                 {
                     pblock->nNonce++;
