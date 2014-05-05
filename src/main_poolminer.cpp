@@ -79,7 +79,11 @@ void convertDataToBlock(unsigned char* blockData, CBlock& block) {
 
 uint256 hexToHash(std::string hex) {
 	CBigNum n;
-	n.setvch(ParseHex(hex));
+	// Reverse, too
+	std::vector<unsigned char> v = ParseHex(hex);
+	std::vector<unsigned char> v2;
+	for(int i = v.size() - 1;i >= 0;i--) v2.push_back(v[i]);
+	n.setvch(v2);
 	return n.getuint256();
 }
 
@@ -131,11 +135,13 @@ public:
 		
 		//std::cout << "MERKLE ROOT: " << block->hashMerkleRoot.GetHex() << std::endl;
 		//std::cout << "EN2: " << extranonce2 << std::endl;
-		
-		merkles[block->hashMerkleRoot] = extranonce2;
+		{
+			boost::unique_lock<boost::shared_mutex> lock(_mutex_merkles);
+			merkles[block->hashMerkleRoot] = extranonce2;
+		}
 		
 		block->nTime = GetAdjustedTimeWithOffset(0, 0); // No need to mess with times
-		std::cout << "[WORKER" << thread_id << "] block created @ " << block->nTime << std::endl;
+		//std::cout << "[WORKER" << thread_id << "] block created @ " << block->nTime << std::endl;
 		return block;
 	}
 	
@@ -160,18 +166,22 @@ public:
 			_block = newblock;
 		}
 		if (old_block != NULL) delete old_block;
+		CBlockIndex *pindexOld = pindexBest;
+		pindexBest = new CBlockIndex(); //=notify worker (this could need a efficient alternative)
+		delete pindexOld;
 	}
 
 	void setBlocksFromData(mArray params) {
 		job_id = params[0].get_str();
 		CBlock* block = new CBlock();
-		block->hashPrevBlock = hexToHash(params[1].get_str());
-		std::cout << "PREVHASH: " << block->hashPrevBlock.GetHex() << std::endl;
+		//block->hashPrevBlock = hexToHash(params[1].get_str());
+		block->hashPrevBlock.SetHex(params[1].get_str());
+		//std::cout << "PREVHASH: " << block->hashPrevBlock.GetHex() << std::endl;
 		coinb1 = params[2].get_str();
 		coinb2 = params[3].get_str();
 		
-		std::cout << "COINB1: " << coinb1 << std::endl;
-		std::cout << "COINB2: " << coinb2 << std::endl;
+		//std::cout << "COINB1: " << coinb1 << std::endl;
+		//std::cout << "COINB2: " << coinb2 << std::endl;
 		
 		mArray mb = params[4].get_array();
 		merkle_branch.clear();
@@ -180,35 +190,46 @@ public:
 		CBigNum c;
 		c.setvch(ParseHex(params[5].get_str()));
 		block->nVersion = c.getint();
-		std::cout << "VERSION: " << block->nVersion << std::endl;
+		//std::cout << "VERSION: " << block->nVersion << std::endl;
 		c.setvch(ParseHex(params[6].get_str()));
 		block->nBits = c.getint();
-		std::cout << "BITS: " << block->nBits << std::endl;
+		//std::cout << "BITS: " << block->nBits << std::endl;
 		c.setvch(ParseHex(params[7].get_str()));
 		block->nTime = c.getint();
-		std::cout << "TIME: " << block->nTime << std::endl;
+		//std::cout << "TIME: " << block->nTime << std::endl;
 		block->nNonce = 0;
 		block->bnPrimeChainMultiplier = 0;
 		
 		unsigned int nTime_local = time(NULL);
 		unsigned int nTime_server = block->nTime;
 		nTime_offset = nTime_local > nTime_server ? 0 : (nTime_server-nTime_local);
-		
+		{
+			boost::unique_lock<boost::shared_mutex> lock(_mutex_merkles);
+			merkles.clear();
+		}
 		setBlockTo(block);
-		
-		merkles.clear();
 	}
 
 	void submitBlock(CBlock *block, unsigned int thread_id) {
 		if (socket_to_server != NULL) {
 			
+			//std::cout << block->GetHeaderHash().GetHex() << std::endl;
+			//std::cout << block->bnPrimeChainMultiplier.ToString() << std::endl;
+			
+			std::string extranonce2 = "";
+			
 			// Get mapped extranonce
-			std::string extranonce2 = merkles[block->hashMerkleRoot]; // Should always work if worker threads are updating
+			{
+				boost::unique_lock<boost::shared_mutex> lock(_mutex_merkles);
+				extranonce2 = merkles[block->hashMerkleRoot]; // Should always work if worker threads are updating
+			}
 			if(extranonce2 == "") extranonce2 = "ffffffff"; // So that we dont crash in case of a problem, but the share will be invalid
+			
 			// Encode time, nonce, and primemultiplier
 			std::string time = HexStr(BEGIN(block->nTime), END(block->nTime));
 			std::string nonce = HexStr(BEGIN(block->nNonce), END(block->nNonce));
 			std::string pm = block->bnPrimeChainMultiplier.GetHex();
+			
 			
 			// Prepare the JSON packet
 			Object submit_msg;
@@ -228,6 +249,8 @@ public:
 			// Send the line
 			
 			if(socket_to_server != NULL) boost::asio::write(*socket_to_server, boost::asio::buffer(write(submit_msg) + "\n"));
+			
+			totalShareCount++;
 		}
 	}
 
@@ -238,6 +261,7 @@ protected:
 	std::string coinb2;
 	int extranonce2_size;
 	
+	boost::shared_mutex _mutex_merkles;
 	std::map<uint256, std::string> merkles;
 	
 	std::vector<std::string> merkle_branch;
@@ -413,17 +437,16 @@ public:
 							}
 							else if(method == "mining.notify") {
 								_bprovider->setBlocksFromData(params);
-								CBlockIndex *pindexOld = pindexBest;
-								pindexBest = new CBlockIndex(); //=notify worker (this could need a efficient alternative)
-								delete pindexOld;
 								std::cout << "Work recieved!" << std::endl;
 							}
-								
-							std::stringstream ss;
-							ss << "{\"error\": null, \"id\": " << obj["id"].get_int() << ", \"result\": null}\n";
-							std::string res = ss.str();
-							boost::asio::write(*socket_to_server, boost::asio::buffer(res.c_str(), strlen(res.c_str())));
-							
+							if(obj.count("id") > 0) { // If no ID, no need to respond
+								if(!obj["id"].is_null()) {
+									std::stringstream ss;
+									ss << "{\"error\": null, \"id\": " << obj["id"].get_int() << ", \"result\": null}\n";
+									std::string res = ss.str();
+									boost::asio::write(*socket_to_server, boost::asio::buffer(res.c_str(), strlen(res.c_str())));
+								}
+							}
 						}
 						else {
 							// Result of an operation
@@ -447,13 +470,22 @@ public:
 							
 							// Share submit result
 							else if(id >= 1000 && id < 1000000) {
-								bool worked  = res.get_bool();
-								if(worked) {
-									
-								}
-								else {
+								bool retval = res.get_int();
+								if(retval <= 0) {
 									std::cout << "Share submission failed!" << std::endl;
 									reject_counter++;
+									if(reject_counter == 3) {
+										std::cout << "Too many rejects. Forcing reconnect..." << std::endl;
+										break;
+									}
+								}
+								{
+									std::map<int,unsigned long>::iterator it = statistics.find(retval);
+									if (it == statistics.end())
+										statistics.insert(std::pair<int,unsigned long>(retval,1));
+									else
+										statistics[retval]++;
+									reject_counter = 0;
 								}
 								stats_running();
 							}
@@ -590,18 +622,19 @@ int main(int argc, char **argv)
 {
 	// ### DO -NOT- REMOVE
 	std::cout << "********************************************" << std::endl;
-	std::cout << "*** Xolominer - Primecoin Pool Miner v" << VERSION_MAJOR << "." << VERSION_MINOR << VERSION_EXT << std::endl;
+	std::cout << "*** XoloStrataMiner - Primecoin Pool Miner v" << VERSION_MAJOR << "." << VERSION_MINOR << VERSION_EXT << std::endl;
 	std::cout << "*** by xolokram/TB - visit www.beeeeer.org" << std::endl;
+	std::cout << "*** ported for use with the stratum protocol by KillerByte - visit xpool.xram.co" << std::endl;
 	std::cout << "***" << std::endl;
 	std::cout << "*** thanks to Sunny King & mikaelh" << std::endl;
 	std::cout << "*** press CTRL+C to exit" << std::endl;
 	std::cout << "********************************************" << std::endl;
 	std::cout << "***" << std::endl;
 	std::cout << "*** CAUTION:" << std::endl;
-	std::cout << "*** This is primecoin mining software; if you don't know what this means" << std::endl;
-	std::cout << "*** or you don't want to mine primecoins or you've found this on your PC" << std::endl;
-	std::cout << "*** without prior knowledge, please contact 'xolokram' on" << std::endl;
-	std::cout << "*** http://board.beeeeer.org or via IRC at #beeeeer.org on FreeNode" << std::endl;
+	std::cout << "*** This is primecoin mining software; if you don't know what this means," << std::endl;
+	std::cout << "*** don't want to mine primecoins, or you've found this on your PC" << std::endl;
+	std::cout << "*** without prior knowledge, please contact 'KillerByte' on" << std::endl;
+	std::cout << "*** peercointalk.org, or via IRC at #xrampool on FreeNode" << std::endl;
 	std::cout << "***" << std::endl;
 	std::cout << "********************************************" << std::endl;
 
