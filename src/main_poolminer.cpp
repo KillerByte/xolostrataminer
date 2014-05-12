@@ -395,8 +395,8 @@ public:
 				totalShareCount = 0;
 			}
 
-			// Subscribe
-			std::string buf = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
+			// Subscribe and authorize
+			std::string buf = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" + pool_username + "\",\"" + pool_password + "\"]}\n";
 			socket->write_some(boost::asio::buffer(buf));
 
 			socket_to_server = socket.get(); //TODO: lock/mutex
